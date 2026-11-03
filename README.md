@@ -4,7 +4,7 @@ Home Assistant Apps (add-ons) for Akshar Pediatrics' PracticeOps.
 
 | App | What it does |
 |---|---|
-| [PracticeOps Office Agent](practiceops_agent/DOCS.md) | Carries out PracticeOps UniFi user and card requests and sends the IT / Network dashboard, in office hours |
+| [PracticeOps Office Agent](practiceops_agent/DOCS.md) | Carries out PracticeOps UniFi user and card requests, sends the IT / Network dashboard and the vaccine fridge and freezer temperatures, in office hours |
 
 ## Install
 

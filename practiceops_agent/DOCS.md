@@ -9,12 +9,17 @@ office side:
   active UniFi users so badges made in UniFi are linked to the right employee for the time clock.
 - **IT / Network dashboard.** It reads the console every 5 minutes, and the live throughput every
   minute.
+- **Vaccine fridge and freezer temperatures.** Every 5 minutes it sends PracticeOps 5-minute averages of
+  each Home Assistant temperature sensor with "fridge" or "freezer" in its name. Overnight and weekend
+  readings go in one batch when the office opens. This only feeds the PracticeOps display and VFC log:
+  the alarms run in Home Assistant itself, around the clock, whether or not this App is running.
 
 Door taps never go through this App. The readers and the console decide those on their own, so doors
 keep working if the Pi, PracticeOps or the internet is down.
 
 It works in office hours only (Mon–Fri 7:45–5:15, Sat 7:45–12:15) so PracticeOps can sleep at night.
-Requests made at other times wait for the next morning.
+Requests made at other times wait for the next morning. In PracticeOps, turn on **Watching** for
+each fridge and freezer (Vaccines → Temperatures) after its first readings arrive.
 
 ## Setup
 

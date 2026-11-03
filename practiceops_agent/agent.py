@@ -11,6 +11,10 @@ so the PracticeOps server can sleep at night; outside those hours it just waits.
     badges made in UniFi are linked to employees by exact name (for the time clock).
   * UniFi Network: every minute the WAN rates for the live strip; every 5 minutes the reads the
     IT / Network dashboard needs (PracticeOps sends the list).
+  * Vaccine fridge and freezer temperatures: every 5 minutes, 5-minute averages of each Home Assistant
+    temperature sensor with "fridge" or "freezer" in its name, read from Home Assistant's history. The
+    first run of the day also sends everything since the last one (overnight, the weekend). The alarms
+    themselves run in Home Assistant, around the clock; this only feeds the PracticeOps display.
 
 Door taps never come through here; the UniFi readers and console decide those on their own.
 
@@ -32,15 +36,17 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DATA = os.environ.get("AGENT_DATA", "/data")
 OPTIONS_FILE = os.path.join(DATA, "options.json")
 STATE_FILE = os.path.join(DATA, "state.json")
 API_BASE = "https://api-ops.aksharpediatrics.care/api/v1"
+HA_API = os.environ.get("HA_API", "http://supervisor/core/api")
 
 OFFICE = ZoneInfo("America/New_York")
 # (open, close) in minutes after midnight by weekday, Monday = 0; the same hours as PracticeOps.
@@ -52,6 +58,11 @@ LIVE_EVERY_SECONDS = 60       # live throughput point
 FULL_EVERY_SECONDS = 290      # full dashboard
 ENROLL_WAIT_SECONDS = 90      # how long to wait for the card tap when enrolling
 SYNC_RETRY_SECONDS = 600      # a failed daily user sync is tried again after this
+TEMPS_EVERY_SECONDS = 300     # temperatures go to PracticeOps this often
+TEMP_BUCKET = timedelta(minutes=5)
+TEMPS_FIRST_RUN = timedelta(hours=6)  # on the very first run, send this much history
+TEMPS_MAX_GAP = timedelta(days=7)     # never more than this (Home Assistant keeps 10 days)
+TEMP_WORDS = ("fridge", "freezer", "refrigerator")
 MAC = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 LOCAL_TLS = ssl.create_default_context()  # the console's own certificate is self-signed
@@ -265,7 +276,73 @@ class Network:
         return self.sanitizer.clean(out)
 
 
-# ------------------------------------------------------------------ the two loops
+class HomeAssistant:
+    """Home Assistant's own API, through the Supervisor (the App's config asks for homeassistant_api)."""
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def get(self, path: str):
+        status, out = _http("GET", HA_API + path, {"Authorization": f"Bearer {self.token}"}, timeout=60)
+        if status >= 400 or out is None:
+            raise RuntimeError(f"Home Assistant answered {status}")
+        return out
+
+    def temperature_sensors(self) -> dict[str, dict]:
+        """entity_id -> {name, unit} for each temperature sensor with fridge or freezer in its name."""
+        out = {}
+        for s in self.get("/states"):
+            entity, attrs = s.get("entity_id") or "", s.get("attributes") or {}
+            name = str(attrs.get("friendly_name") or entity)
+            if (entity.startswith("sensor.") and attrs.get("device_class") == "temperature"
+                    and any(w in (entity + " " + name).lower() for w in TEMP_WORDS)):
+                unit = "F" if "F" in str(attrs.get("unit_of_measurement") or "") else "C"
+                out[entity] = {"name": name[:120], "unit": unit}
+        return out
+
+    def history(self, entities: list[str], start: datetime, end: datetime) -> dict[str, list]:
+        """entity_id -> [(time, value or None)], including the value at start."""
+        query = urllib.parse.urlencode({"filter_entity_id": ",".join(entities), "end_time": end.isoformat(),
+                                        "minimal_response": "", "no_attributes": ""})
+        rows = self.get(f"/history/period/{urllib.parse.quote(start.isoformat())}?{query}")
+        out = {}
+        for series in rows or []:
+            if not series:
+                continue
+            entity = series[0].get("entity_id")
+            points = []
+            for p in series:
+                try:
+                    value = float(p.get("state"))
+                except (TypeError, ValueError):
+                    value = None  # unavailable / unknown: a gap
+                points.append((datetime.fromisoformat(p["last_changed"]), value))
+            out[entity] = points
+        return out
+
+
+def averages(points: list, start: datetime, end: datetime) -> list[tuple[datetime, float]]:
+    """Time-weighted 5-minute averages from Home Assistant's change history. A value holds until the next
+    change; buckets with less than half their time covered by a reading are skipped."""
+    out = []
+    bucket = start
+    while bucket < end:
+        stop = bucket + TEMP_BUCKET
+        total = covered = 0.0
+        for i, (at, value) in enumerate(points):
+            until = points[i + 1][0] if i + 1 < len(points) else end
+            lo, hi = max(at, bucket), min(until, stop)
+            if value is not None and hi > lo:
+                seconds = (hi - lo).total_seconds()
+                total += value * seconds
+                covered += seconds
+        if covered >= TEMP_BUCKET.total_seconds() / 2:
+            out.append((bucket + TEMP_BUCKET / 2, round(total / covered, 2)))
+        bucket = stop
+    return out
+
+
+# ------------------------------------------------------------------ the loops
 
 class Agent:
     def __init__(self, options: dict, state: dict):
@@ -277,6 +354,8 @@ class Agent:
         akey, nkey = options.get("unifi_access_key"), options.get("unifi_network_key")
         self.access = Access(options.get("access_url") or f"https://{host}:12445", akey) if akey else None
         self.network = Network(options.get("network_url") or f"https://{host}", nkey, sanitizer) if nkey else None
+        ha_token = os.environ.get("SUPERVISOR_TOKEN")
+        self.ha = HomeAssistant(ha_token) if ha_token else None
         self.stop = threading.Event()
 
     def working(self) -> bool:
@@ -371,12 +450,47 @@ class Agent:
             log(f"Network: dashboard updated ({len(results)} of {len(plan.get('calls') or [])} reads)")
         return max(LIVE_EVERY_SECONDS - (time.monotonic() - started), 1)
 
+    # Temperatures: 5-minute averages since the last send (overnight and weekends included).
+    def temperatures_step(self):
+        sensors = self.ha.temperature_sensors()
+        if not sensors:
+            if not self.state.get("_no_sensors_logged"):
+                log("Temperatures: no Home Assistant temperature sensor with fridge or freezer in its name yet")
+                self.state["_no_sensors_logged"] = True
+            return TEMPS_EVERY_SECONDS
+        now = datetime.now(timezone.utc)
+        end = now - timedelta(seconds=now.timestamp() % TEMP_BUCKET.total_seconds())
+        try:
+            start = datetime.fromisoformat(self.state["temps_until"])
+        except (KeyError, TypeError, ValueError):
+            start = end - TEMPS_FIRST_RUN
+        start = max(start, end - TEMPS_MAX_GAP)
+        if start >= end:
+            return TEMPS_EVERY_SECONDS
+        readings = []
+        for entity, points in self.ha.history(sorted(sensors), start, end).items():
+            info = sensors.get(entity)
+            if info:
+                readings += [{"source_key": entity, "value": v, "unit": info["unit"], "name": info["name"],
+                              "at": at.isoformat()} for at, v in averages(points, start, end)]
+        for i in range(0, len(readings), 500):
+            self.ops.call("/stock/temperatures/ingest", {"readings": readings[i:i + 500]})
+        self.state["temps_until"] = end.isoformat()
+        save_state(self.state)
+        if end - start > TEMP_BUCKET * 2:
+            log(f"Temperatures: sent {len(readings)} readings for {len(sensors)} sensor(s) since "
+                f"{start.astimezone(OFFICE):%a %H:%M}")
+        return TEMPS_EVERY_SECONDS
+
     def start(self) -> list[threading.Thread]:
         threads = []
         if self.access:
             threads.append(threading.Thread(target=self.run_loop, args=("Access", self.access_step), daemon=True))
         if self.network:
             threads.append(threading.Thread(target=self.run_loop, args=("Network", self.network_step), daemon=True))
+        if self.ha:
+            threads.append(threading.Thread(target=self.run_loop, args=("Temperatures", self.temperatures_step),
+                                            daemon=True))
         for t in threads:
             t.start()
         return threads
@@ -390,9 +504,17 @@ def load_state() -> dict:
         state = {}
     if not state.get("salt"):  # keeps device tokens the same across restarts
         state["salt"] = secrets.token_hex(16)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"salt": state["salt"]}, f)
+        save_state(state)
     return state
+
+
+def save_state(state: dict) -> None:
+    """Only what must survive a restart: the MAC salt and how far temperatures have been sent."""
+    keep = {k: state[k] for k in ("salt", "temps_until") if k in state}
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(keep, f)
+    os.replace(tmp, STATE_FILE)
 
 
 def main() -> int:
@@ -409,11 +531,12 @@ def main() -> int:
     agent = Agent(options, load_state())
     log(f"PracticeOps office agent {VERSION} started. UniFi Access key: "
         f"{'set' if agent.access else 'missing (user and card requests will wait)'}. UniFi Network key: "
-        f"{'set' if agent.network else 'missing (the network dashboard will not update)'}."
+        f"{'set' if agent.network else 'missing (the network dashboard will not update)'}. Temperatures: "
+        f"{'on' if agent.ha else 'off (not running inside Home Assistant)'}."
         + (" Ignoring office hours (testing)." if agent.always else ""))
     threads = agent.start()
     if not threads:
-        log("Neither UniFi key is set, so there is nothing to do. Add them in the Configuration tab.")
+        log("There is nothing to do: add the UniFi keys in the Configuration tab.")
         return 1
     while all(t.is_alive() for t in threads):
         time.sleep(5)
