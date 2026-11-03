@@ -5,7 +5,8 @@ office side:
 
 - **UniFi users and cards.** Requests made on an employee's PracticeOps profile (create the UniFi user,
   enroll a card, remove a card, deactivate) start within a couple of seconds. Once a day it also checks
-  that everyone removed from PracticeOps is deactivated in UniFi.
+  that everyone removed from PracticeOps is deactivated in UniFi, and sends PracticeOps the names of
+  active UniFi users so badges made in UniFi are linked to the right employee for the time clock.
 - **IT / Network dashboard.** It reads the console every 5 minutes, and the live throughput every
   minute.
 

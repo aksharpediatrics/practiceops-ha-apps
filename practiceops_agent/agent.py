@@ -7,6 +7,8 @@ so the PracticeOps server can sleep at night; outside those hours it just waits.
   * UniFi Access: waits on PracticeOps for user and card requests (create the UniFi user, enroll a
     card at a reader, remove a card, deactivate, the daily check of removed staff) and does them with
     the Access API. A request starts within a couple of seconds of the click in PracticeOps.
+  * Once a day, the UniFi -> PracticeOps user sync: the id and name of every active Access user, so
+    badges made in UniFi are linked to employees by exact name (for the time clock).
   * UniFi Network: every minute the WAN rates for the live strip; every 5 minutes the reads the
     IT / Network dashboard needs (PracticeOps sends the list).
 
@@ -34,7 +36,7 @@ import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DATA = os.environ.get("AGENT_DATA", "/data")
 OPTIONS_FILE = os.path.join(DATA, "options.json")
 STATE_FILE = os.path.join(DATA, "state.json")
@@ -49,6 +51,7 @@ LIST_EVERY_SECONDS = 300      # how often to send PracticeOps the readers and do
 LIVE_EVERY_SECONDS = 60       # live throughput point
 FULL_EVERY_SECONDS = 290      # full dashboard
 ENROLL_WAIT_SECONDS = 90      # how long to wait for the card tap when enrolling
+SYNC_RETRY_SECONDS = 600      # a failed daily user sync is tried again after this
 MAC = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 LOCAL_TLS = ssl.create_default_context()  # the console's own certificate is self-signed
@@ -163,17 +166,29 @@ class Access:
         user = self.call("GET", f"/users/{user_id}") or {}
         return [str(c["id"]) for c in user.get("nfc_cards") or [] if c.get("id")]
 
+    def users(self):
+        """Every Access user, page by page."""
+        for page in range(1, 51):
+            data = self.call("GET", f"/users?page_num={page}&page_size=100") or []
+            items = (data.get("items") if isinstance(data, dict) else data) or []
+            yield from (u for u in items if isinstance(u, dict))
+            if len(items) < 100:
+                return
+
     def find_user(self, first: str, last: str):
         first, last = (first or "").strip().lower(), (last or "").strip().lower()
-        for page in range(1, 41):
-            users = self.call("GET", f"/users?page_num={page}&page_size=200") or []
-            for u in users:
-                if (str(u.get("first_name") or "").strip().lower() == first
-                        and str(u.get("last_name") or "").strip().lower() == last and u.get("status") != "DELETED"):
-                    return u
-            if len(users) < 200:
-                return None
-        return None
+        return next((u for u in self.users() if str(u.get("first_name") or "").strip().lower() == first
+                     and str(u.get("last_name") or "").strip().lower() == last and u.get("status") != "DELETED"),
+                    None)
+
+    def active_users(self) -> list[dict]:
+        """Only what the user sync needs: id and name of each active user (no cards, email or PINs)."""
+        out = []
+        for u in self.users():
+            first, last = str(u.get("first_name") or "").strip(), str(u.get("last_name") or "").strip()
+            if u.get("status") == "ACTIVE" and u.get("id") and first and last:
+                out.append({"id": str(u["id"]), "first_name": first, "last_name": last, "status": "ACTIVE"})
+        return out
 
     def do(self, req: dict) -> dict:
         action, uid = req.get("action"), req.get("unifi_user_id")
@@ -293,8 +308,26 @@ class Agent:
             if pause:
                 self.stop.wait(pause)
 
+    def sync_users(self) -> None:
+        """Once a day: the active UniFi users go to PracticeOps, which links exact names to employees
+        and marks staff no longer active in UniFi as inactive (it skips that if the list looks cut off)."""
+        today = datetime.now(OFFICE).date().isoformat()
+        if self.state.get("_synced_on") == today or time.monotonic() < self.state.get("_sync_retry", 0):
+            return
+        try:
+            users = self.access.active_users()
+            out = self.ops.call("/office-agent/unifi/users", {"users": users, "complete": True}) or {}
+        except Exception as exc:
+            self.state["_sync_retry"] = time.monotonic() + SYNC_RETRY_SECONDS
+            log(f"Access: daily user sync failed, trying again in 10 minutes: {exc}")
+            return
+        self.state["_synced_on"] = today
+        log(f"Access: daily user sync: {len(users)} active UniFi users; {out.get('mapped', 0)} newly linked, "
+            f"{out.get('reviews', 0)} to review, {out.get('deactivated', 0)} marked inactive")
+
     # UniFi Access: wait on PracticeOps; do each request as soon as it arrives.
     def access_step(self):
+        self.sync_users()
         body: dict = {"version": VERSION, "wait_seconds": POLL_WAIT_SECONDS}
         if time.monotonic() - self.state.get("_listed", -1e9) >= LIST_EVERY_SECONDS:
             try:
