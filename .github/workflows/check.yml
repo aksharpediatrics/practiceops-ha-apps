@@ -46,3 +46,31 @@ jobs:
             echo "should have stopped without a token"; exit 1
           fi
           grep "No PracticeOps token" out.txt
+
+  esphome:
+    # The vaccine fridge and freezer monitor, built with this repo's sht1x component.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('esphome/*.yaml') }}
+      - run: pip install esphome
+      - name: Compile
+        working-directory: esphome
+        run: |
+          sed -i 's|- source: github://.*|- source: { type: local, path: ../components }|' vaccine-temps.yaml
+          cat > secrets.yaml <<'SECRETS'
+          vaccine_temps_api_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+          vaccine_temps_ota_password: "test"
+          wifi_ssid: "home"
+          wifi_password: "testtest"
+          office_wifi_ssid: "office"
+          office_wifi_password: "testtest"
+          fallback_hotspot_password: "testtest"
+          SECRETS
+          esphome compile vaccine-temps.yaml

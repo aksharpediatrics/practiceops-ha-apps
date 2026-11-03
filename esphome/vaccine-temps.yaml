@@ -1,0 +1,67 @@
+# Vaccine fridge and freezer: one ESP32 with two FS200-SHT10 probes.
+#
+# The ESPHome "New device" wizard makes the first part (name, board, logger, api, ota). Keep the
+# file it made, delete its wifi: section, and paste everything from "Paste from here" at the end.
+
+esphome:
+  name: vaccine-temps
+  friendly_name: Vaccine temperatures
+
+esp32:
+  board: esp32dev
+
+logger:
+
+api:
+  encryption:
+    key: !secret vaccine_temps_api_key
+
+ota:
+  - platform: esphome
+    password: !secret vaccine_temps_ota_password
+
+# ---------------------------------------------------------------- Paste from here
+
+# Joins whichever Wi-Fi is in range, so it can be set up at home and just plugged in at the office.
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    - ssid: !secret office_wifi_ssid
+      password: !secret office_wifi_password
+  power_save_mode: none
+  # If neither Wi-Fi works it makes its own hotspot, to enter a new Wi-Fi from a phone.
+  ap:
+    ssid: Vaccine Temps Setup
+    password: !secret fallback_hotspot_password
+
+captive_portal:
+
+external_components:
+  - source: github://aksharpediatrics/practiceops-ha-apps@sht1x-1.0.0
+    components: [sht1x]
+
+# Wires on each probe: red = 3V3, black = GND, green = data, yellow = clock,
+# and a 10k resistor from each green (data) wire to 3V3.
+sensor:
+  - platform: sht1x
+    data_pin: GPIO25
+    clock_pin: GPIO26
+    update_interval: 60s
+    temperature:
+      name: Vaccine fridge temperature
+    humidity:
+      name: Vaccine fridge humidity
+
+  - platform: sht1x
+    data_pin: GPIO32
+    clock_pin: GPIO33
+    update_interval: 60s
+    temperature:
+      name: Vaccine freezer temperature
+    humidity:
+      name: Vaccine freezer humidity
+
+  - platform: wifi_signal
+    name: Wi-Fi signal
+    update_interval: 300s
