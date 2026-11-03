@@ -1,0 +1,24 @@
+name: PracticeOps Office Agent
+version: "2.0.0"
+slug: practiceops_agent
+description: >-
+  Carries out PracticeOps UniFi user and card requests within seconds and sends the IT / Network
+  dashboard. Office hours only.
+url: https://github.com/aksharpediatrics/practiceops-ha-apps
+arch:
+  - aarch64
+  - amd64
+options:
+  practiceops_token: ""
+  unifi_access_key: ""
+  unifi_network_key: ""
+  console_host: 192.168.1.1
+schema:
+  practiceops_token: password
+  unifi_access_key: password?
+  unifi_network_key: password?
+  console_host: str
+  ignore_office_hours: bool?
+  api_base: url?
+  access_url: url?
+  network_url: url?

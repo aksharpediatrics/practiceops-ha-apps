@@ -1,0 +1,25 @@
+configuration:
+  practiceops_token:
+    name: PracticeOps token
+    description: From PracticeOps > Admin > Network > Create token. Paste it here only.
+  unifi_access_key:
+    name: UniFi Access API key
+    description: For creating UniFi users and enrolling cards. Leave empty to skip.
+  unifi_network_key:
+    name: UniFi Network API key
+    description: For the IT / Network dashboard. Leave empty to skip.
+  console_host:
+    name: UniFi console address
+    description: The console's IP address on the office network.
+  ignore_office_hours:
+    name: Ignore office hours
+    description: For testing only. Leave off so PracticeOps can sleep at night.
+  api_base:
+    name: PracticeOps API address
+    description: Leave empty.
+  access_url:
+    name: UniFi Access address override
+    description: Leave empty.
+  network_url:
+    name: UniFi Network address override
+    description: Leave empty.
