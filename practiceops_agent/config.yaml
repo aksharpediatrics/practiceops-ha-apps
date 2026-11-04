@@ -1,9 +1,10 @@
 name: PracticeOps Office Agent
-version: "2.2.0"
+version: "2.3.0"
 slug: practiceops_agent
 description: >-
   Carries out PracticeOps UniFi user and card requests within seconds, sends the IT / Network
-  dashboard and the vaccine fridge and freezer temperatures. Office hours only.
+  dashboard, the vaccine fridge and freezer temperatures and a read-only view of Home Assistant.
+  Office hours only.
 url: https://github.com/aksharpediatrics/practiceops-ha-apps
 homeassistant_api: true
 arch:

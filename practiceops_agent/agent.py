@@ -11,10 +11,14 @@ so the PracticeOps server can sleep at night; outside those hours it just waits.
     badges made in UniFi are linked to employees by exact name (for the time clock).
   * UniFi Network: every minute the WAN rates for the live strip; every 5 minutes the reads the
     IT / Network dashboard needs (PracticeOps sends the list).
+  * Every 5 minutes, every UniFi user's card IDs (the printed number, never the card's token), so the
+    PracticeOps Employees list shows who really has a badge.
   * Vaccine fridge and freezer temperatures: every 5 minutes, 5-minute averages of each Home Assistant
     temperature sensor with "fridge" or "freezer" in its name, read from Home Assistant's history. The
     first run of the day also sends everything since the last one (overnight, the weekend). The alarms
     themselves run in Home Assistant, around the clock; this only feeds the PracticeOps display.
+  * Home Assistant, read-only: every 5 minutes its version and the state of its devices and sensors
+    (no people or places: person, device_tracker and zone are never sent).
 
 Door taps never come through here; the UniFi readers and console decide those on their own.
 
@@ -41,7 +45,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DATA = os.environ.get("AGENT_DATA", "/data")
 OPTIONS_FILE = os.path.join(DATA, "options.json")
 STATE_FILE = os.path.join(DATA, "state.json")
@@ -63,6 +67,12 @@ TEMP_BUCKET = timedelta(minutes=5)
 TEMPS_FIRST_RUN = timedelta(hours=6)  # on the very first run, send this much history
 TEMPS_MAX_GAP = timedelta(days=7)     # never more than this (Home Assistant keeps 10 days)
 TEMP_WORDS = ("fridge", "freezer", "refrigerator")
+# What the Home Assistant page in PracticeOps shows; anything else (people, places, cameras) stays here.
+SNAPSHOT_DOMAINS = ("sensor", "binary_sensor", "switch", "light", "climate", "cover", "lock", "fan", "update",
+                    "automation", "input_boolean", "alarm_control_panel", "siren", "humidifier", "water_heater")
+SNAPSHOT_ATTRIBUTES = ("installed_version", "latest_version", "title", "release_url", "last_triggered", "current",
+                       "current_temperature", "temperature", "hvac_action", "hvac_mode", "brightness",
+                       "battery_level")
 MAC = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 LOCAL_TLS = ssl.create_default_context()  # the console's own certificate is self-signed
@@ -192,6 +202,11 @@ class Access:
                      and str(u.get("last_name") or "").strip().lower() == last and u.get("status") != "DELETED"),
                     None)
 
+    def all_cards(self) -> dict[str, list[str]]:
+        """UniFi user id -> the printed IDs of their cards (tokens never leave the office)."""
+        return {str(u["id"]): [str(c["id"]) for c in u.get("nfc_cards") or [] if isinstance(c, dict) and c.get("id")]
+                for u in self.users() if u.get("id") and u.get("nfc_cards")}
+
     def active_users(self) -> list[dict]:
         """Only what the user sync needs: id and name of each active user (no cards, email or PINs)."""
         out = []
@@ -288,10 +303,10 @@ class HomeAssistant:
             raise RuntimeError(f"Home Assistant answered {status}")
         return out
 
-    def temperature_sensors(self) -> dict[str, dict]:
+    def temperature_sensors(self, states: list) -> dict[str, dict]:
         """entity_id -> {name, unit} for each temperature sensor with fridge or freezer in its name."""
         out = {}
-        for s in self.get("/states"):
+        for s in states:
             entity, attrs = s.get("entity_id") or "", s.get("attributes") or {}
             name = str(attrs.get("friendly_name") or entity)
             if (entity.startswith("sensor.") and attrs.get("device_class") == "temperature"
@@ -319,6 +334,21 @@ class HomeAssistant:
                 points.append((datetime.fromisoformat(p["last_changed"]), value))
             out[entity] = points
         return out
+
+
+def ha_snapshot(states: list, config: dict) -> dict:
+    """What PracticeOps shows of Home Assistant: its version and the state of devices and sensors."""
+    entities = []
+    for s in states:
+        entity, attrs = str(s.get("entity_id") or ""), s.get("attributes") or {}
+        if entity.split(".", 1)[0] not in SNAPSHOT_DOMAINS:
+            continue
+        entities.append({"entity_id": entity, "name": attrs.get("friendly_name") or entity, "state": s.get("state"),
+                         "unit": attrs.get("unit_of_measurement"), "device_class": attrs.get("device_class"),
+                         "last_changed": s.get("last_changed"),
+                         "attributes": {k: attrs[k] for k in SNAPSHOT_ATTRIBUTES if k in attrs}})
+    return {"config": {"version": config.get("version"), "location_name": config.get("location_name")},
+            "entities": entities[:3000]}
 
 
 def averages(points: list, start: datetime, end: datetime) -> list[tuple[datetime, float]]:
@@ -411,8 +441,9 @@ class Agent:
         if time.monotonic() - self.state.get("_listed", -1e9) >= LIST_EVERY_SECONDS:
             try:
                 body["readers"], body["policies"] = self.access.readers(), self.access.policies()
+                body["cards"] = self.access.all_cards()
             except Exception as exc:
-                log(f"Access: couldn't list readers and door policies: {exc}")
+                log(f"Access: couldn't list readers, door policies and cards: {exc}")
             self.state["_listed"] = time.monotonic()
         asked = time.monotonic()
         todo = self.ops.call("/office-agent/unifi/poll", body) or []
@@ -450,9 +481,20 @@ class Agent:
             log(f"Network: dashboard updated ({len(results)} of {len(plan.get('calls') or [])} reads)")
         return max(LIVE_EVERY_SECONDS - (time.monotonic() - started), 1)
 
+    # Home Assistant: the read-only snapshot, then the temperatures.
+    def home_assistant_step(self):
+        states = self.ha.get("/states")
+        try:
+            self.ops.call("/office-agent/home-assistant", ha_snapshot(states, self.ha.get("/config") or {}))
+        except Refused:
+            raise
+        except Exception as exc:
+            log(f"Home Assistant: couldn't send the snapshot: {exc}")
+        return self.temperatures(states)
+
     # Temperatures: 5-minute averages since the last send (overnight and weekends included).
-    def temperatures_step(self):
-        sensors = self.ha.temperature_sensors()
+    def temperatures(self, states: list):
+        sensors = self.ha.temperature_sensors(states)
         if not sensors:
             if not self.state.get("_no_sensors_logged"):
                 log("Temperatures: no Home Assistant temperature sensor with fridge or freezer in its name yet")
@@ -489,7 +531,7 @@ class Agent:
         if self.network:
             threads.append(threading.Thread(target=self.run_loop, args=("Network", self.network_step), daemon=True))
         if self.ha:
-            threads.append(threading.Thread(target=self.run_loop, args=("Temperatures", self.temperatures_step),
+            threads.append(threading.Thread(target=self.run_loop, args=("Home Assistant", self.home_assistant_step),
                                             daemon=True))
         for t in threads:
             t.start()
@@ -531,7 +573,7 @@ def main() -> int:
     agent = Agent(options, load_state())
     log(f"PracticeOps office agent {VERSION} started. UniFi Access key: "
         f"{'set' if agent.access else 'missing (user and card requests will wait)'}. UniFi Network key: "
-        f"{'set' if agent.network else 'missing (the network dashboard will not update)'}. Temperatures: "
+        f"{'set' if agent.network else 'missing (the network dashboard will not update)'}. Home Assistant and temperatures: "
         f"{'on' if agent.ha else 'off (not running inside Home Assistant)'}."
         + (" Ignoring office hours (testing)." if agent.always else ""))
     threads = agent.start()

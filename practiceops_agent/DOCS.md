@@ -9,6 +9,11 @@ office side:
   active UniFi users so badges made in UniFi are linked to the right employee for the time clock.
 - **IT / Network dashboard.** It reads the console every 5 minutes, and the live throughput every
   minute.
+- **Badges.** Every 5 minutes it sends PracticeOps each UniFi user's card numbers (never the card's
+  secret token), so the Employees list shows who has a badge.
+- **Home Assistant page.** Every 5 minutes it sends PracticeOps Home Assistant's version and the state
+  of its devices and sensors, shown read-only. People and places (person, device tracker, zone) are
+  never sent.
 - **Vaccine fridge and freezer temperatures.** Every 5 minutes it sends PracticeOps 5-minute averages of
   each Home Assistant temperature sensor with "fridge" or "freezer" in its name. Overnight and weekend
   readings go in one batch when the office opens. This only feeds the PracticeOps display and VFC log:

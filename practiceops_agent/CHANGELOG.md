@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.3.0
+
+- Sends every UniFi user's card IDs every 5 minutes, so the PracticeOps Employees list shows who really
+  has a badge (badges can now be added, replaced and removed right from that list).
+- Sends a read-only snapshot of Home Assistant (version, devices and sensors; never people or places)
+  for the new Home Assistant page in PracticeOps.
+
 ## 2.2.0
 
 - Sends the vaccine fridge and freezer temperatures from Home Assistant to PracticeOps (5-minute
