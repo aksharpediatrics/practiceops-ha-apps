@@ -17,8 +17,9 @@ so the PracticeOps server can sleep at night; outside those hours it just waits.
     temperature sensor with "fridge" or "freezer" in its name, read from Home Assistant's history. The
     first run of the day also sends everything since the last one (overnight, the weekend). The alarms
     themselves run in Home Assistant, around the clock; this only feeds the PracticeOps display.
-  * Home Assistant, read-only: every 5 minutes its version and the state of its devices and sensors
-    (no people or places: person, device_tracker and zone are never sent).
+  * Home Assistant, read-only: every 5 minutes its version and the state of its devices and sensors,
+    each with its device, area, manufacturer and model (no people or places: person, device_tracker and
+    zone are never sent; cameras send their state only, never a picture or a link to one).
 
 Door taps never come through here; the UniFi readers and console decide those on their own.
 
@@ -45,7 +46,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 DATA = os.environ.get("AGENT_DATA", "/data")
 OPTIONS_FILE = os.path.join(DATA, "options.json")
 STATE_FILE = os.path.join(DATA, "state.json")
@@ -69,10 +70,19 @@ TEMPS_MAX_GAP = timedelta(days=7)     # never more than this (Home Assistant kee
 TEMP_WORDS = ("fridge", "freezer", "refrigerator")
 # What the Home Assistant page in PracticeOps shows; anything else (people, places, cameras) stays here.
 SNAPSHOT_DOMAINS = ("sensor", "binary_sensor", "switch", "light", "climate", "cover", "lock", "fan", "update",
-                    "automation", "input_boolean", "alarm_control_panel", "siren", "humidifier", "water_heater")
+                    "automation", "input_boolean", "alarm_control_panel", "siren", "humidifier", "water_heater",
+                    "camera", "event")
 SNAPSHOT_ATTRIBUTES = ("installed_version", "latest_version", "title", "release_url", "last_triggered", "current",
                        "current_temperature", "temperature", "hvac_action", "hvac_mode", "brightness",
-                       "battery_level")
+                       "battery_level", "event_type")
+# Each entity's device, area, manufacturer and model (the REST API's states don't carry them).
+DEVICES_TEMPLATE = (
+    "[{% for s in states if s.domain in " + repr(list(SNAPSHOT_DOMAINS)) + " %}"
+    "[{{ s.entity_id | tojson }},"
+    "{{ (device_attr(s.entity_id, 'name_by_user') or device_attr(s.entity_id, 'name')) | tojson }},"
+    "{{ area_name(s.entity_id) | tojson }},"
+    "{{ device_attr(s.entity_id, 'manufacturer') | tojson }},"
+    "{{ device_attr(s.entity_id, 'model') | tojson }}]{{ ',' if not loop.last }}{% endfor %}]")
 MAC = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$")
 
 LOCAL_TLS = ssl.create_default_context()  # the console's own certificate is self-signed
@@ -303,6 +313,14 @@ class HomeAssistant:
             raise RuntimeError(f"Home Assistant answered {status}")
         return out
 
+    def devices(self) -> dict[str, list]:
+        """entity_id -> [device, area, manufacturer, model]; empty if Home Assistant won't render it."""
+        status, out = _http("POST", HA_API + "/template", {"Authorization": f"Bearer {self.token}"},
+                            {"template": DEVICES_TEMPLATE}, timeout=60)
+        if status >= 400 or not isinstance(out, list):
+            return {}
+        return {row[0]: row[1:] for row in out if isinstance(row, list) and len(row) == 5}
+
     def temperature_sensors(self, states: list) -> dict[str, dict]:
         """entity_id -> {name, unit} for each temperature sensor with fridge or freezer in its name."""
         out = {}
@@ -336,9 +354,10 @@ class HomeAssistant:
         return out
 
 
-def ha_snapshot(states: list, config: dict) -> dict:
+def ha_snapshot(states: list, config: dict, devices: dict | None = None) -> dict:
     """What PracticeOps shows of Home Assistant: its version and the state of devices and sensors."""
     entities = []
+    devices = devices or {}
     for s in states:
         entity, attrs = str(s.get("entity_id") or ""), s.get("attributes") or {}
         if entity.split(".", 1)[0] not in SNAPSHOT_DOMAINS:
@@ -346,6 +365,7 @@ def ha_snapshot(states: list, config: dict) -> dict:
         entities.append({"entity_id": entity, "name": attrs.get("friendly_name") or entity, "state": s.get("state"),
                          "unit": attrs.get("unit_of_measurement"), "device_class": attrs.get("device_class"),
                          "last_changed": s.get("last_changed"),
+                         **dict(zip(("device", "area", "manufacturer", "model"), devices.get(entity) or [])),
                          "attributes": {k: attrs[k] for k in SNAPSHOT_ATTRIBUTES if k in attrs}})
     return {"config": {"version": config.get("version"), "location_name": config.get("location_name")},
             "entities": entities[:3000]}
@@ -485,7 +505,8 @@ class Agent:
     def home_assistant_step(self):
         states = self.ha.get("/states")
         try:
-            self.ops.call("/office-agent/home-assistant", ha_snapshot(states, self.ha.get("/config") or {}))
+            self.ops.call("/office-agent/home-assistant",
+                          ha_snapshot(states, self.ha.get("/config") or {}, self.ha.devices()))
         except Refused:
             raise
         except Exception as exc:

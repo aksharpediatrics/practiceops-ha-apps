@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.4.0
+
+- The Home Assistant snapshot carries each device's name, area, manufacturer and model, so
+  PracticeOps can show printers, cameras and room conditions in their own sections. Cameras send their
+  state only (never a picture or a link to one).
+
 ## 2.3.0
 
 - Sends every UniFi user's card IDs every 5 minutes, so the PracticeOps Employees list shows who really

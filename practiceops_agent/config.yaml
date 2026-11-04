@@ -1,5 +1,5 @@
 name: PracticeOps Office Agent
-version: "2.3.0"
+version: "2.4.0"
 slug: practiceops_agent
 description: >-
   Carries out PracticeOps UniFi user and card requests within seconds, sends the IT / Network

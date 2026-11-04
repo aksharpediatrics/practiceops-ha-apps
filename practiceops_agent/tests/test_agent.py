@@ -59,3 +59,17 @@ def test_card_ids_without_tokens():
     a = agent.Access("https://console", "key")
     a.users = lambda: iter([{"id": "u1", "nfc_cards": [{"id": "100001", "token": "secret"}]}, {"id": "u2", "nfc_cards": []}])
     assert a.all_cards() == {"u1": ["100001"]}
+
+
+def test_snapshot_carries_devices_and_never_camera_pictures():
+    states = [{"entity_id": "camera.front", "state": "idle",
+               "attributes": {"friendly_name": "Front", "entity_picture": "/api/camera_proxy/camera.front?token=t",
+                              "access_token": "t"}},
+              {"entity_id": "sensor.printer_black_toner", "state": "40", "attributes": {"unit_of_measurement": "%"}}]
+    devices = {"camera.front": ["Front doorbell", "Entrance", "Ring", "Video Doorbell 4"],
+               "sensor.printer_black_toner": ["Office printer", "Front desk", "Brother", "MFC-L2750DW"]}
+    out = agent.ha_snapshot(states, {}, devices)
+    cam, toner = out["entities"]
+    assert cam["device"] == "Front doorbell" and cam["manufacturer"] == "Ring" and cam["attributes"] == {}
+    assert "token" not in str(out) and toner["area"] == "Front desk" and toner["model"] == "MFC-L2750DW"
+    assert "{% for s in states" in agent.DEVICES_TEMPLATE and "'camera'" in agent.DEVICES_TEMPLATE
