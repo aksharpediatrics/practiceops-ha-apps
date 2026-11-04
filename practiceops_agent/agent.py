@@ -20,6 +20,10 @@ so the PracticeOps server can sleep at night; outside those hours it just waits.
   * Home Assistant, read-only: every 5 minutes its version and the state of its devices and sensors,
     each with its device, area, manufacturer and model (no people or places: person, device_tracker and
     zone are never sent; cameras send their state only, never a picture or a link to one).
+  * Camera pictures: every 30 seconds in office hours the latest picture of each camera (640 pixels wide),
+    and a picture whenever a camera's motion, doorbell or sound sensor goes off (checked every 5 seconds,
+    at most one a minute per camera). Events outside office hours are kept on the Pi (up to 300) and
+    sent when the office opens.
 
 Door taps never come through here; the UniFi readers and console decide those on their own.
 
@@ -31,6 +35,7 @@ Standard library only, so there is nothing to install or update but Python itsel
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -46,7 +51,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 DATA = os.environ.get("AGENT_DATA", "/data")
 OPTIONS_FILE = os.path.join(DATA, "options.json")
 STATE_FILE = os.path.join(DATA, "state.json")
@@ -71,10 +76,18 @@ TEMP_WORDS = ("fridge", "freezer", "refrigerator")
 # What the Home Assistant page in PracticeOps shows; anything else (people, places, cameras) stays here.
 SNAPSHOT_DOMAINS = ("sensor", "binary_sensor", "switch", "light", "climate", "cover", "lock", "fan", "update",
                     "automation", "input_boolean", "alarm_control_panel", "siren", "humidifier", "water_heater",
-                    "camera", "event")
+                    "camera", "event", "weather")
 SNAPSHOT_ATTRIBUTES = ("installed_version", "latest_version", "title", "release_url", "last_triggered", "current",
                        "current_temperature", "temperature", "hvac_action", "hvac_mode", "brightness",
-                       "battery_level", "event_type")
+                       "battery_level", "event_type", "current_humidity", "target_temp_low", "target_temp_high",
+                       "fan_mode", "fan", "preset_mode", "equipment_running", "humidity", "wind_speed",
+                       "wind_speed_unit", "temperature_unit", "min_temp", "max_temp")
+CAMERA_EVERY_SECONDS = 30     # the latest picture of each camera, in office hours
+EVENT_CHECK_SECONDS = 5       # how often the motion / doorbell / sound sensors are looked at
+EVENT_COOLDOWN_SECONDS = 60   # at most one event picture a minute per camera
+CAMERA_WIDTH = 640
+QUEUE_MAX = 300               # event pictures kept on the Pi while the office is closed
+QUEUE_DIR = os.path.join(DATA, "camera_queue")
 # Each entity's device, area, manufacturer and model (the REST API's states don't carry them).
 DEVICES_TEMPLATE = (
     "[{% for s in states if s.domain in " + repr(list(SNAPSHOT_DOMAINS)) + " %}"
@@ -162,6 +175,7 @@ class PracticeOps:
 class Access:
     def __init__(self, base: str, key: str):
         self.base, self.key = base.rstrip("/") + "/api/v1/developer", key
+        self._readers_logged: list | None = None
 
     def call(self, method: str, path: str, body=None, allow_failure: bool = False):
         status, out = _http(method, self.base + path, {"Authorization": f"Bearer {self.key}"}, body,
@@ -177,16 +191,27 @@ class Access:
         raise Refused(f"UniFi Access said: {msg or 'no answer'} ({code or status})")
 
     def readers(self) -> list[dict]:
-        out = []
-        for group in self.call("GET", "/devices") or []:
+        """The devices a card can be tapped on. UniFi labels them differently by model and firmware, so a
+        device counts unless it plainly can't read cards (a hub or a door lock with no NFC); if that leaves
+        none, every device is offered rather than none."""
+        devices = []
+        for group in self.call("GET", "/devices?refresh=true") or []:
             for d in group if isinstance(group, list) else [group]:
-                if not isinstance(d, dict) or not d.get("id"):
-                    continue
-                caps = d.get("capabilities") or []
-                if caps and "nfc" not in caps:
-                    continue
-                out.append({"id": d["id"], "name": d.get("alias") or d.get("name") or d.get("type"),
-                            "type": d.get("type")})
+                if isinstance(d, dict) and d.get("id"):
+                    devices.append(d)
+        def can_read(d: dict) -> bool:
+            caps = " ".join(str(c) for c in d.get("capabilities") or []).lower()
+            kind = str(d.get("type") or "").upper()
+            if caps:
+                return "nfc" in caps or "card" in caps
+            return not (kind.startswith("UAH") or kind.startswith("UA-HUB") or "LOCK" in kind)
+        picked = [d for d in devices if can_read(d)] or devices
+        out = [{"id": d["id"], "name": d.get("alias") or d.get("name") or d.get("type"), "type": d.get("type")}
+               for d in picked]
+        if out != self._readers_logged:
+            log(f"Access: {len(devices)} device(s) in UniFi; card readers offered in PracticeOps: "
+                f"{', '.join(str(r['name']) + ' (' + str(r['type']) + ')' for r in out) or 'none'}")
+            self._readers_logged = out
         return out
 
     def policies(self) -> list[dict]:
@@ -321,6 +346,17 @@ class HomeAssistant:
             return {}
         return {row[0]: row[1:] for row in out if isinstance(row, list) and len(row) == 5}
 
+    def picture(self, entity_id: str) -> bytes | None:
+        """The camera's current picture, made 640 pixels wide by Home Assistant (None if it has none)."""
+        req = urllib.request.Request(f"{HA_API}/camera_proxy/{entity_id}?width={CAMERA_WIDTH}",
+                                     headers={"Authorization": f"Bearer {self.token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                kind, data = resp.headers.get("Content-Type", ""), resp.read()
+        except (urllib.error.URLError, OSError):
+            return None
+        return data if kind.startswith("image/jpeg") and data else None
+
     def temperature_sensors(self, states: list) -> dict[str, dict]:
         """entity_id -> {name, unit} for each temperature sensor with fridge or freezer in its name."""
         out = {}
@@ -369,6 +405,44 @@ def ha_snapshot(states: list, config: dict, devices: dict | None = None) -> dict
                          "attributes": {k: attrs[k] for k in SNAPSHOT_ATTRIBUTES if k in attrs}})
     return {"config": {"version": config.get("version"), "location_name": config.get("location_name")},
             "entities": entities[:3000]}
+
+
+def camera_triggers(states: list, devices: dict) -> tuple[dict[str, str], dict[str, list[tuple[str, str]]]]:
+    """The cameras ({entity_id: name}) and, for each, its motion / doorbell / sound sensors
+    ([(entity_id, "motion" | "ding" | "sound")]): the sensors on the same device, or named like the camera."""
+    names = {s.get("entity_id"): (s.get("attributes") or {}).get("friendly_name") or s.get("entity_id")
+             for s in states}
+    cameras = {e: n for e, n in names.items() if str(e).startswith("camera.")}
+    triggers: dict[str, list[tuple[str, str]]] = {c: [] for c in cameras}
+    for s in states:
+        entity, attrs = str(s.get("entity_id") or ""), s.get("attributes") or {}
+        domain, label = entity.split(".", 1)[0], f"{entity} {attrs.get('friendly_name') or ''}".lower()
+        cls = attrs.get("device_class") or ""
+        if domain == "binary_sensor" and cls in ("motion", "occupancy", "presence") or "motion" in label:
+            kind = "motion"
+        elif "ding" in label or "doorbell" in label or cls == "doorbell":
+            kind = "ding"
+        elif cls == "sound" or "sound" in label or "audio" in label:
+            kind = "sound"
+        else:
+            continue
+        if domain not in ("binary_sensor", "event"):
+            continue
+        device = (devices.get(entity) or [None])[0]
+        for camera, name in cameras.items():
+            same_device = device and (devices.get(camera) or [None])[0] == device
+            if same_device or (not device and str(name).lower() in label):
+                triggers[camera].append((entity, kind))
+                break
+    return cameras, triggers
+
+
+def went_off(state: dict) -> bool:
+    """A sensor turned on, or an event fired (an event's state is the time it last fired)."""
+    value = state.get("state")
+    if str(state.get("entity_id", "")).startswith("event."):
+        return value not in (None, "unknown", "unavailable")
+    return value == "on"
 
 
 def averages(points: list, start: datetime, end: datetime) -> list[tuple[datetime, float]]:
@@ -545,6 +619,96 @@ class Agent:
                 f"{start.astimezone(OFFICE):%a %H:%M}")
         return TEMPS_EVERY_SECONDS
 
+    # Cameras: a picture every 30 seconds in office hours, and one on each motion / ring / sound.
+    def camera_loop(self) -> None:
+        cameras: dict[str, str] = {}
+        triggers: dict[str, list[tuple[str, str]]] = {}
+        seen: dict[str, tuple] = {}
+        last_event: dict[str, float] = {}
+        refresh_at = latest_at = 0.0
+        quiet_until = 0.0
+        while not self.stop.is_set():
+            try:
+                now = time.monotonic()
+                if now >= refresh_at:  # which cameras there are, and their sensors
+                    cameras, triggers = camera_triggers(self.ha.get("/states"), self.ha.devices())
+                    refresh_at = now + 300
+                    if cameras and not self.state.get("_cameras_logged"):
+                        log(f"Cameras: {len(cameras)} camera(s), "
+                            f"{sum(len(t) for t in triggers.values())} motion / doorbell / sound sensor(s)")
+                        self.state["_cameras_logged"] = True
+                for camera, sensors in triggers.items():
+                    for entity, kind in sensors:
+                        st = self.ha.get(f"/states/{entity}") or {}
+                        key = (st.get("state"), st.get("last_changed"))
+                        before, seen[entity] = seen.get(entity), key
+                        if before is None or before == key or not went_off(st):
+                            continue
+                        if time.monotonic() - last_event.get(camera, -1e9) < EVENT_COOLDOWN_SECONDS:
+                            continue
+                        last_event[camera] = time.monotonic()
+                        self.camera_picture(camera, cameras[camera], "EVENT", kind)
+                if self.working() and time.monotonic() >= quiet_until:
+                    self.send_queued()
+                    if time.monotonic() >= latest_at:
+                        for camera, name in cameras.items():
+                            self.camera_picture(camera, name, "LATEST", None)
+                        latest_at = time.monotonic() + CAMERA_EVERY_SECONDS
+            except Refused as exc:
+                log(f"Cameras: {exc}")
+                quiet_until = time.monotonic() + 300
+            except Exception as exc:  # Home Assistant restarting, the internet down: try again shortly
+                if time.monotonic() >= quiet_until:
+                    log(f"Cameras: {type(exc).__name__}: {exc}")
+                quiet_until = time.monotonic() + 60
+            self.stop.wait(EVENT_CHECK_SECONDS)
+
+    def camera_picture(self, camera: str, name: str, kind: str, event: str | None) -> None:
+        image = self.ha.picture(camera)
+        if image is None:
+            return
+        body = {"entity_id": camera, "name": name, "kind": kind, "event": event,
+                "taken_at": datetime.now(timezone.utc).isoformat(), "content_type": "image/jpeg",
+                "image_b64": base64.b64encode(image).decode()}
+        if kind == "EVENT":
+            log(f"Cameras: {event} at {name}")
+        if not self.working():
+            if kind == "EVENT":
+                self.queue(body)
+            return
+        try:
+            self.ops.call("/office-agent/cameras/snapshots", body)
+        except Refused:
+            raise
+        except Exception:
+            if kind == "EVENT":
+                self.queue(body)  # sent with the next batch
+            raise
+
+    def queue(self, body: dict) -> None:
+        os.makedirs(QUEUE_DIR, exist_ok=True)
+        files = sorted(os.listdir(QUEUE_DIR))
+        for old in files[:max(0, len(files) - QUEUE_MAX + 1)]:  # keep the newest QUEUE_MAX
+            os.remove(os.path.join(QUEUE_DIR, old))
+        name = f"{time.time_ns()}.json"
+        with open(os.path.join(QUEUE_DIR, name + ".tmp"), "w", encoding="utf-8") as f:
+            json.dump(body, f)
+        os.replace(os.path.join(QUEUE_DIR, name + ".tmp"), os.path.join(QUEUE_DIR, name))
+
+    def send_queued(self) -> None:
+        """Event pictures from while the office was closed, oldest first."""
+        if not os.path.isdir(QUEUE_DIR):
+            return
+        files = sorted(f for f in os.listdir(QUEUE_DIR) if f.endswith(".json"))
+        for name in files:
+            path = os.path.join(QUEUE_DIR, name)
+            with open(path, encoding="utf-8") as f:
+                body = json.load(f)
+            self.ops.call("/office-agent/cameras/snapshots", body)
+            os.remove(path)
+        if files:
+            log(f"Cameras: sent {len(files)} event picture(s) from while the office was closed")
+
     def start(self) -> list[threading.Thread]:
         threads = []
         if self.access:
@@ -554,6 +718,7 @@ class Agent:
         if self.ha:
             threads.append(threading.Thread(target=self.run_loop, args=("Home Assistant", self.home_assistant_step),
                                             daemon=True))
+            threads.append(threading.Thread(target=self.camera_loop, daemon=True))
         for t in threads:
             t.start()
         return threads

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.0
+
+- Camera pictures for PracticeOps: the latest picture of each camera every 30 seconds in office hours,
+  and a picture whenever a camera's motion, doorbell or sound sensor goes off (at most one a minute
+  per camera). Events outside office hours are kept on the Pi and sent when the office opens.
+- More thermostat (Ecobee) details and the weather for the Home Assistant page.
+
 ## 2.4.0
 
 - The Home Assistant snapshot carries each device's name, area, manufacturer and model, so

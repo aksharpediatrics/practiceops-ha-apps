@@ -14,6 +14,11 @@ office side:
 - **Home Assistant page.** Every 5 minutes it sends PracticeOps Home Assistant's version and the state
   of its devices and sensors, shown read-only. People and places (person, device tracker, zone) are
   never sent.
+- **Camera pictures.** Every 30 seconds in office hours, the latest picture of each camera in Home
+  Assistant (Ring and others), and a picture whenever a camera's motion, doorbell or sound sensor goes
+  off. Pictures taken while the office is closed wait on the Pi (up to 300) and go when it opens.
+  PracticeOps keeps event pictures for 30 days, and only people who can see its Home Assistant page
+  can see them.
 - **Vaccine fridge and freezer temperatures.** Every 5 minutes it sends PracticeOps 5-minute averages of
   each Home Assistant temperature sensor with "fridge" or "freezer" in its name. Overnight and weekend
   readings go in one batch when the office opens. This only feeds the PracticeOps display and VFC log:

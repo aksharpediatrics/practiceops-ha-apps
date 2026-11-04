@@ -73,3 +73,39 @@ def test_snapshot_carries_devices_and_never_camera_pictures():
     assert cam["device"] == "Front doorbell" and cam["manufacturer"] == "Ring" and cam["attributes"] == {}
     assert "token" not in str(out) and toner["area"] == "Front desk" and toner["model"] == "MFC-L2750DW"
     assert "{% for s in states" in agent.DEVICES_TEMPLATE and "'camera'" in agent.DEVICES_TEMPLATE
+
+
+def test_camera_sensors_are_found_by_device_or_name():
+    states = [
+        {"entity_id": "camera.front_door", "attributes": {"friendly_name": "Front Door"}},
+        {"entity_id": "camera.back", "attributes": {"friendly_name": "Back"}},
+        {"entity_id": "binary_sensor.front_door_motion", "attributes": {"device_class": "motion"}},
+        {"entity_id": "event.front_door_ding", "attributes": {"friendly_name": "Front Door Ding"}},
+        {"entity_id": "binary_sensor.back_sound", "attributes": {"friendly_name": "Back Sound", "device_class": "sound"}},
+        {"entity_id": "sensor.front_door_last_motion", "attributes": {}},  # not a trigger (a timestamp sensor)
+        {"entity_id": "binary_sensor.office_door", "attributes": {"device_class": "door"}},
+    ]
+    devices = {"camera.front_door": ["Front Door"], "binary_sensor.front_door_motion": ["Front Door"],
+               "event.front_door_ding": ["Front Door"]}
+    cameras, triggers = agent.camera_triggers(states, devices)
+    assert cameras == {"camera.front_door": "Front Door", "camera.back": "Back"}
+    assert sorted(triggers["camera.front_door"]) == [("binary_sensor.front_door_motion", "motion"),
+                                                     ("event.front_door_ding", "ding")]
+    assert triggers["camera.back"] == [("binary_sensor.back_sound", "sound")]
+    assert agent.went_off({"entity_id": "binary_sensor.x", "state": "on"})
+    assert not agent.went_off({"entity_id": "binary_sensor.x", "state": "off"})
+    assert agent.went_off({"entity_id": "event.x", "state": "2026-11-04T15:00:00+00:00"})
+    assert not agent.went_off({"entity_id": "event.x", "state": "unavailable"})
+
+
+def test_readers_are_offered_even_when_unifi_labels_them_differently():
+    a = agent.Access("https://console", "key")
+    hub = {"id": "h1", "name": "UA-HUB-1", "type": "UAH"}
+    g2 = {"id": "r1", "alias": "Front door", "type": "UA-G2-PRO"}
+    a.call = lambda method, path, body=None, allow_failure=False: [[hub, g2]]
+    assert [r["name"] for r in a.readers()] == ["Front door"]  # no capabilities listed: the hub is left out
+    g3 = {"id": "r2", "alias": "Back", "type": "UA-G3", "capabilities": ["nfc_card", "pin_code"]}
+    a.call = lambda method, path, body=None, allow_failure=False: [[hub, g3]]
+    assert [r["name"] for r in a.readers()] == ["Back"]
+    a.call = lambda method, path, body=None, allow_failure=False: [[hub]]
+    assert [r["name"] for r in a.readers()] == ["UA-HUB-1"]  # better to offer something than nothing
